@@ -4,6 +4,8 @@ DEVKITPRO_PATH="/opt/devkitpro"
 
 set -e
 
+export PATH="$HOME/.local/bin:$PATH"
+
 echo "======================================"
 echo "TOTK MouseCam Final - Linux Builder"
 echo "======================================"
@@ -41,8 +43,8 @@ if [ $SKIP_MOD -eq 0 ]; then
 fi
 
 echo "[1/4] Installing Python dependencies..."
-pip3 install -r companion/requirements.txt -q
-pip3 install pyinstaller -q
+pip3 install --break-system-packages -r companion/requirements.txt -q
+pip3 install --break-system-packages pyinstaller -q
 echo "Done."
 echo ""
 
