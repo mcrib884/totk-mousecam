@@ -19,8 +19,6 @@ deploy/
 companion/dist/
 companion/build/
 companion/*.spec
-companion/injector/*.dll
-companion/injector/*.obj
 companion/*.log
 companion/*.txt
 

@@ -70,16 +70,8 @@ echo.
 echo [3/4] Building companion app...
 cd companion
 
-echo   - Building Injector DLL...
-call injector\build_injector.cmd
-if %ERRORLEVEL% neq 0 (
-    echo ERROR: Injector build failed.
-    pause
-    exit /b 1
-)
-
 if not exist "dist\windows" mkdir dist\windows
-pyinstaller --onefile --noconsole --uac-admin --add-binary "injector/MouseCamInjector.dll;." --name MouseCamCompanion --distpath dist\windows mousecam_companion.py
+pyinstaller --onefile --noconsole --uac-admin --name MouseCamCompanion --distpath dist\windows mousecam_companion.py
 if %ERRORLEVEL% neq 0 (
     echo ERROR: Companion build failed.
     cd ..

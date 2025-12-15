@@ -10,18 +10,50 @@ import queue
 import time
 from pathlib import Path
 
+# Memory scan region size preferences (MB). Order matters.
+# These correspond to common contiguous guest-RAM mappings in Switch emulators.
+PREFERRED_REGION_SIZES_MB = [6144, 4096, 8192]
+PREFERRED_REGION_SIZE_TOLERANCE_MB = 16
+
+CHUNK_SIZE = 50 * 1024 * 1024
+MIN_REGION_SIZE = 1 * 1024 * 1024
+PRIORITY_ALIGNMENT = 256 * 1024 * 1024
+
+
+def _preferred_region_rank(size_bytes):
+    tol = PREFERRED_REGION_SIZE_TOLERANCE_MB * 1024 * 1024
+    size_bytes = int(size_bytes)
+    for i, mb in enumerate(PREFERRED_REGION_SIZES_MB):
+        pref = mb * 1024 * 1024
+        if abs(size_bytes - pref) <= tol:
+            return i
+    return None
+
+
 if sys.platform == 'win32':
     import ctypes
     from ctypes import wintypes
     import keyboard as keyboard_lib
 
     kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+    psapi = ctypes.WinDLL('psapi', use_last_error=True)
 
     PROCESS_QUERY_INFORMATION = 0x0400
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    PROCESS_VM_OPERATION = 0x0008
     PROCESS_VM_READ = 0x0010
+    PROCESS_VM_WRITE = 0x0020
+
     MEM_COMMIT = 0x1000
+    MEM_MAPPED = 0x40000
+    MEM_PRIVATE = 0x20000
+
+    PAGE_NOACCESS = 0x01
     PAGE_READWRITE = 0x04
     PAGE_EXECUTE_READWRITE = 0x40
+    PAGE_GUARD = 0x100
+
+    TH32CS_SNAPPROCESS = 0x00000002
 
     class MEMORY_BASIC_INFORMATION(ctypes.Structure):
         _fields_ = [
@@ -34,6 +66,64 @@ if sys.platform == 'win32':
             ("Protect", wintypes.DWORD),
             ("Type", wintypes.DWORD)
         ]
+
+    class PROCESSENTRY32(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", wintypes.DWORD),
+            ("cntUsage", wintypes.DWORD),
+            ("th32ProcessID", wintypes.DWORD),
+            ("th32DefaultHeapID", ctypes.c_void_p),
+            ("th32ModuleID", wintypes.DWORD),
+            ("cntThreads", wintypes.DWORD),
+            ("th32ParentProcessID", wintypes.DWORD),
+            ("pcPriClassBase", wintypes.LONG),
+            ("dwFlags", wintypes.DWORD),
+            ("szExeFile", ctypes.c_char * 260),
+        ]
+
+    class PROCESS_MEMORY_COUNTERS(ctypes.Structure):
+        _fields_ = [
+            ("cb", wintypes.DWORD),
+            ("PageFaultCount", wintypes.DWORD),
+            ("PeakWorkingSetSize", ctypes.c_size_t),
+            ("WorkingSetSize", ctypes.c_size_t),
+            ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+            ("QuotaPagedPoolUsage", ctypes.c_size_t),
+            ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+            ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+            ("PagefileUsage", ctypes.c_size_t),
+            ("PeakPagefileUsage", ctypes.c_size_t),
+        ]
+
+    kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+
+    kernel32.Process32First.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32)]
+    kernel32.Process32First.restype = wintypes.BOOL
+
+    kernel32.Process32Next.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32)]
+    kernel32.Process32Next.restype = wintypes.BOOL
+
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    kernel32.VirtualQueryEx.argtypes = [wintypes.HANDLE, ctypes.c_void_p, ctypes.POINTER(MEMORY_BASIC_INFORMATION), ctypes.c_size_t]
+    kernel32.VirtualQueryEx.restype = ctypes.c_size_t
+
+    kernel32.ReadProcessMemory.argtypes = [wintypes.HANDLE, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.POINTER(ctypes.c_size_t)]
+    kernel32.ReadProcessMemory.restype = wintypes.BOOL
+
+    kernel32.WriteProcessMemory.argtypes = [wintypes.HANDLE, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.POINTER(ctypes.c_size_t)]
+    kernel32.WriteProcessMemory.restype = wintypes.BOOL
+
+    kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+    kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+
+    psapi.GetProcessMemoryInfo.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESS_MEMORY_COUNTERS), wintypes.DWORD]
+    psapi.GetProcessMemoryInfo.restype = wintypes.BOOL
 else:
     from pynput import keyboard as keyboard_lib
 
@@ -58,48 +148,96 @@ class WindowsScanner(MemoryScanner):
         super().__init__()
         self.handle = None
         self.pid = 0
-        self._write_func = kernel32.WriteProcessMemory
-        self._write_func.argtypes = [wintypes.HANDLE, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.POINTER(ctypes.c_size_t)]
-        self._write_func.restype = wintypes.BOOL
+        self.can_write = False
         self._written = ctypes.c_size_t(0)
 
+    def _get_working_set(self, pid):
+        h = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not h:
+            return 0
+        try:
+            pmc = PROCESS_MEMORY_COUNTERS()
+            pmc.cb = ctypes.sizeof(PROCESS_MEMORY_COUNTERS)
+            if psapi.GetProcessMemoryInfo(h, ctypes.byref(pmc), pmc.cb):
+                return int(pmc.WorkingSetSize)
+        finally:
+            kernel32.CloseHandle(h)
+        return 0
+
     def find_process(self, process_names):
-        TH32CS_SNAPPROCESS = 0x00000002
-        class PROCESSENTRY32(ctypes.Structure):
-            _fields_ = [("dwSize", wintypes.DWORD),
-                        ("cntUsage", wintypes.DWORD),
-                        ("th32ProcessID", wintypes.DWORD),
-                        ("th32DefaultHeapID", ctypes.c_void_p),
-                        ("th32ModuleID", wintypes.DWORD),
-                        ("cntThreads", wintypes.DWORD),
-                        ("th32ParentProcessID", wintypes.DWORD),
-                        ("pcPriClassBase", wintypes.LONG),
-                        ("dwFlags", wintypes.DWORD),
-                        ("szExeFile", ctypes.c_char * 260)]
+        want = {p.lower() for p in process_names}
 
         hSnap = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+        if not hSnap:
+            return None, None
+
+        processes = {}
+        candidates = []
+
         pe32 = PROCESSENTRY32()
         pe32.dwSize = ctypes.sizeof(PROCESSENTRY32)
 
-        found_pid = None
-        found_name = None
+        try:
+            if kernel32.Process32First(hSnap, ctypes.byref(pe32)):
+                while True:
+                    exe = pe32.szExeFile.decode('ansi', errors='ignore')
+                    pid = int(pe32.th32ProcessID)
+                    ppid = int(pe32.th32ParentProcessID)
 
-        if kernel32.Process32First(hSnap, ctypes.byref(pe32)):
-            while True:
-                exe = pe32.szExeFile.decode('ansi', errors='ignore')
-                if exe in process_names:
-                    found_pid = pe32.th32ProcessID
-                    found_name = exe
-                    break
-                if not kernel32.Process32Next(hSnap, ctypes.byref(pe32)):
-                    break
-        kernel32.CloseHandle(hSnap)
+                    processes[pid] = {'name': exe, 'ppid': ppid}
+                    if exe.lower() in want:
+                        candidates.append(pid)
 
-        if found_pid:
-            self.pid = found_pid
-            self.handle = kernel32.OpenProcess(0x1F0FFF, False, self.pid)
-            return found_name, found_pid
-        return None, None
+                    if not kernel32.Process32Next(hSnap, ctypes.byref(pe32)):
+                        break
+        finally:
+            kernel32.CloseHandle(hSnap)
+
+        if not candidates:
+            return None, None
+
+        children = {}
+        for pid, info in processes.items():
+            children.setdefault(info.get('ppid', 0), []).append(pid)
+
+        final = set(candidates)
+        queue_pids = list(candidates)
+        while queue_pids:
+            parent = queue_pids.pop(0)
+            for child in children.get(parent, []):
+                if child not in final:
+                    final.add(child)
+                    queue_pids.append(child)
+
+        best_pid = None
+        best_ws = -1
+        for pid in final:
+            ws = self._get_working_set(pid)
+            if ws > best_ws:
+                best_ws = ws
+                best_pid = pid
+
+        if best_pid is None:
+            best_pid = max(final)
+
+        desired = PROCESS_QUERY_INFORMATION | PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_VM_OPERATION
+        h = kernel32.OpenProcess(desired, False, best_pid)
+        can_write = True
+        if not h:
+            desired = PROCESS_QUERY_INFORMATION | PROCESS_VM_READ
+            h = kernel32.OpenProcess(desired, False, best_pid)
+            can_write = False
+
+        if not h:
+            self.reset()
+            return None, None
+
+        self.reset()
+        self.pid = best_pid
+        self.handle = h
+        self.can_write = can_write
+
+        return processes.get(best_pid, {}).get('name', ''), best_pid
 
     def is_process_alive(self):
         if not self.handle or self.pid == 0:
@@ -115,34 +253,49 @@ class WindowsScanner(MemoryScanner):
             kernel32.CloseHandle(self.handle)
         self.handle = None
         self.pid = 0
+        self.can_write = False
 
     def scan(self, pid):
-        if not self.handle: return None
+        if not self.handle:
+            return []
 
         mbi = MEMORY_BASIC_INFORMATION()
         address = 0
         found_addresses = []
 
-        MEM_IMAGE = 0x1000000
-        MEM_MAPPED = 0x40000
-        MEM_PRIVATE = 0x20000
-        CHUNK_SIZE = 50 * 1024 * 1024
-        MIN_REGION_SIZE = 1 * 1024 * 1024
-
         regions = []
         while kernel32.VirtualQueryEx(self.handle, ctypes.c_void_p(address), ctypes.byref(mbi), ctypes.sizeof(mbi)):
+            region_base = int(mbi.BaseAddress) if mbi.BaseAddress else int(address)
+            region_size = int(mbi.RegionSize)
+            if region_size <= 0:
+                break
+
+            protect = int(mbi.Protect)
+            is_committed = (mbi.State == MEM_COMMIT)
             is_target_type = (mbi.Type == MEM_MAPPED) or (mbi.Type == MEM_PRIVATE)
-            is_target_perm = (mbi.State == MEM_COMMIT) and (mbi.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE))
+            is_rw = bool(protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE))
+            is_bad = bool(protect & (PAGE_GUARD | PAGE_NOACCESS))
 
-            if is_target_type and is_target_perm and mbi.RegionSize >= MIN_REGION_SIZE:
-                priority = 0 if mbi.Type == MEM_MAPPED else 1
-                regions.append((priority, address, mbi.RegionSize, mbi.Type))
+            if is_committed and is_target_type and is_rw and (not is_bad) and region_size >= MIN_REGION_SIZE:
+                pref_rank = _preferred_region_rank(region_size)
+                pref_bucket = 0 if pref_rank is not None else 1
+                aligned_bucket = 0 if (region_size % PRIORITY_ALIGNMENT == 0) else 1
+                type_bucket = 0 if (mbi.Type == MEM_MAPPED) else 1
+                regions.append((
+                    pref_bucket,
+                    pref_rank if pref_rank is not None else 999,
+                    aligned_bucket,
+                    type_bucket,
+                    -region_size,
+                    region_base,
+                    region_size,
+                ))
 
-            address += mbi.RegionSize
+            address = region_base + region_size
 
-        regions.sort(key=lambda r: (r[0], -r[2]))
+        regions.sort()
 
-        for priority, region_addr, region_size, mem_type in regions:
+        for _, _, _, _, _, region_addr, region_size in regions:
             try:
                 read_offset = 0
                 while read_offset < region_size:
@@ -150,215 +303,44 @@ class WindowsScanner(MemoryScanner):
                     buffer = ctypes.create_string_buffer(size_to_read)
                     bytes_read = ctypes.c_size_t(0)
 
-                    if kernel32.ReadProcessMemory(self.handle, ctypes.c_void_p(region_addr + read_offset), buffer, size_to_read, ctypes.byref(bytes_read)):
-                        raw = buffer.raw
+                    if kernel32.ReadProcessMemory(
+                        self.handle,
+                        ctypes.c_void_p(region_addr + read_offset),
+                        buffer,
+                        size_to_read,
+                        ctypes.byref(bytes_read),
+                    ):
+                        raw = buffer.raw[:bytes_read.value]
                         idx = raw.find(self.magic_bytes)
-                        if idx != -1:
-                            if idx + 8 <= len(raw):
-                                version = struct.unpack('<I', raw[idx+4:idx+8])[0]
-                                if version == 1:
-                                    real_addr = region_addr + read_offset + idx
-                                    found_addresses.append(real_addr)
-                                    return found_addresses
+                        if idx != -1 and (idx + 8) <= len(raw):
+                            version = struct.unpack('<I', raw[idx + 4:idx + 8])[0]
+                            if version == 1:
+                                found_addr = region_addr + read_offset + idx
+                                found_addresses.append(found_addr)
+                                return found_addresses
+
                     read_offset += CHUNK_SIZE
             except Exception:
                 pass
+
         return found_addresses
 
     def write(self, address, data):
-        if not self.handle: return False
-        return self._write_func(self.handle, address, data, len(data), ctypes.byref(self._written))
-
-class WindowsInjector:
-    def __init__(self):
-        self.kernel32 = ctypes.windll.kernel32
-
-        self.kernel32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
-        self.kernel32.OpenProcess.restype = ctypes.c_void_p
-
-        self.kernel32.VirtualAllocEx.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint32, ctypes.c_uint32]
-        self.kernel32.VirtualAllocEx.restype = ctypes.c_void_p
-
-        self.kernel32.WriteProcessMemory.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p]
-        self.kernel32.WriteProcessMemory.restype = ctypes.c_int
-
-        self.kernel32.GetModuleHandleW.argtypes = [ctypes.c_wchar_p]
-        self.kernel32.GetModuleHandleW.restype = ctypes.c_void_p
-
-        self.kernel32.GetProcAddress.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
-        self.kernel32.GetProcAddress.restype = ctypes.c_void_p
-
-        self.kernel32.CreateRemoteThread.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32, ctypes.c_void_p]
-        self.kernel32.CreateRemoteThread.restype = ctypes.c_void_p
-
-        self.kernel32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
-        self.kernel32.WaitForSingleObject.restype = ctypes.c_uint32
-
-        self.kernel32.GetExitCodeThread.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32)]
-        self.kernel32.GetExitCodeThread.restype = ctypes.c_int
-
-    def inject(self, pid, dll_path):
-        PROCESS_ALL_ACCESS = 0x1F0FFF
-        MEM_COMMIT = 0x1000
-        MEM_RESERVE = 0x2000
-        PAGE_READWRITE = 0x04
-
-        h_process = self.kernel32.OpenProcess(PROCESS_ALL_ACCESS, False, pid)
-        if not h_process:
-            print(f"DEBUG: Failed to open process {pid}. Error: {self.kernel32.GetLastError()}")
-            return False
-
-        try:
-            path_bytes = dll_path.encode('utf-8') + b'\0'
-            path_len = len(path_bytes)
-
-            h_process_ptr = ctypes.c_void_p(h_process)
-
-            remote_mem = self.kernel32.VirtualAllocEx(h_process_ptr, None, path_len, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE)
-            if not remote_mem:
-                print(f"DEBUG: VirtualAllocEx failed. Error: {self.kernel32.GetLastError()}")
-                return False
-
-            print(f"DEBUG: Remote memory allocated at: {hex(remote_mem)}")
-
-            written = ctypes.c_size_t(0)
-            remote_mem_ptr = ctypes.c_void_p(remote_mem)
-
-            if not self.kernel32.WriteProcessMemory(h_process_ptr, remote_mem_ptr, path_bytes, path_len, ctypes.byref(written)):
-                err = self.kernel32.GetLastError()
-                print(f"DEBUG: WriteProcessMemory failed. Error Code: {err}")
-                return False
-
-            h_kernel32 = self.kernel32.GetModuleHandleW("kernel32.dll")
-            load_lib = self.kernel32.GetProcAddress(h_kernel32, b"LoadLibraryA")
-            print(f"DEBUG: LoadLibraryA address: {hex(load_lib)}")
-
-            thread_id = ctypes.c_ulong(0)
-            h_thread = self.kernel32.CreateRemoteThread(h_process_ptr, None, 0, ctypes.c_void_p(load_lib), remote_mem_ptr, 0, ctypes.byref(thread_id))
-
-            if not h_thread:
-                err = self.kernel32.GetLastError()
-                print(f"DEBUG: CreateRemoteThread failed. Error Code: {err}")
-                return False
-
-            print(f"DEBUG: Remote thread created. ID: {thread_id.value}")
-            self.kernel32.WaitForSingleObject(h_thread, 5000)
-
-            exit_code = ctypes.c_uint32(0)
-            self.kernel32.GetExitCodeThread(h_thread, ctypes.byref(exit_code))
-            print(f"DEBUG: Remote thread exit code: {hex(exit_code.value)}")
-
-            self.kernel32.CloseHandle(h_thread)
-
-            if exit_code.value == 0:
-                 print("DEBUG: LoadLibraryA failed (Exit Code 0). DLL path check or dependencies missing.")
-                 return False
-
-            return True
-        finally:
-            self.kernel32.CloseHandle(h_process)
-
-class PipeClient:
-    STATUS_MAGIC = 0x53544154
-
-    def __init__(self, pipe_name):
-        self.pipe_name = pipe_name
-        self.handle = None
-        self.kernel32 = ctypes.windll.kernel32
-        self.last_dll_status = ""
-        self.last_status_code = 0
-        self.last_target_count = 0
-
-    def connect(self):
-        try:
-            GENERIC_READ = 0x80000000
-            GENERIC_WRITE = 0x40000000
-            OPEN_EXISTING = 3
-            FILE_ATTRIBUTE_NORMAL = 128
-
-            h_pipe = self.kernel32.CreateFileW(
-                self.pipe_name,
-                GENERIC_READ | GENERIC_WRITE,
-                0,
-                None,
-                OPEN_EXISTING,
-                0,
-                None
-            )
-
-            if h_pipe == -1 or h_pipe == 0xFFFFFFFFFFFFFFFF:
-                err = self.kernel32.GetLastError()
-                if err != 2:
-                    print(f"DEBUG: Pipe CreateFile failed. Error: {err}")
-                return False
-
-            self.handle = h_pipe
-            return True
-        except Exception as e:
-            print(f"DEBUG: Pipe connect exception: {e}")
-            return False
-
-    def write(self, data):
-        if not self.handle: return False
-        try:
-            written = ctypes.c_uint32(0)
-            if not self.kernel32.WriteFile(self.handle, data, len(data), ctypes.byref(written), None):
-                err = self.kernel32.GetLastError()
-                print(f"DEBUG: WriteFile failed. Error: {err}")
-                self.close()
-                return False
-            return True
-        except Exception as e:
-             print(f"DEBUG: WriteFile exception: {e}")
-             self.handle = None
-             return False
-
-    def read_status(self):
         if not self.handle:
-            return None
-        try:
-            bytes_available = ctypes.c_uint32(0)
-            if not self.kernel32.PeekNamedPipe(self.handle, None, 0, None, ctypes.byref(bytes_available), None):
-                return None
+            return False
+        if not isinstance(data, (bytes, bytearray)):
+            data = bytes(data)
+        buf = (ctypes.c_ubyte * len(data)).from_buffer_copy(data)
+        return bool(
+            kernel32.WriteProcessMemory(
+                self.handle,
+                ctypes.c_void_p(address),
+                ctypes.byref(buf),
+                len(data),
+                ctypes.byref(self._written),
+            )
+        )
 
-            if bytes_available.value == 0:
-                return None
-
-            STATUS_SIZE = 76
-            if bytes_available.value >= STATUS_SIZE:
-                buffer = ctypes.create_string_buffer(STATUS_SIZE)
-                bytes_read = ctypes.c_uint32(0)
-
-                if self.kernel32.ReadFile(self.handle, buffer, STATUS_SIZE, ctypes.byref(bytes_read), None):
-                    if bytes_read.value == STATUS_SIZE:
-                        data = buffer.raw
-                        magic = struct.unpack('<I', data[0:4])[0]
-                        if magic == self.STATUS_MAGIC:
-                            status_code = struct.unpack('<I', data[4:8])[0]
-                            target_count = struct.unpack('<I', data[8:12])[0]
-                            message = data[12:76].split(b'\x00')[0].decode('utf-8', errors='ignore')
-
-                            self.last_status_code = status_code
-                            self.last_target_count = target_count
-                            self.last_dll_status = message
-
-                            return {
-                                'code': status_code,
-                                'targets': target_count,
-                                'message': message
-                            }
-            return None
-        except Exception as e:
-            print(f"DEBUG: ReadStatus exception: {e}")
-            return None
-
-    def close(self):
-        if self.handle:
-            try:
-                self.kernel32.CloseHandle(self.handle)
-            except:
-                pass
-            self.handle = None
 
 class LinuxScanner(MemoryScanner):
     def __init__(self):
@@ -474,10 +456,7 @@ class LinuxScanner(MemoryScanner):
         mem_path = f'/proc/{pid}/mem'
         found = []
 
-        CHUNK_SIZE = 50 * 1024 * 1024
-        MIN_REGION_SIZE = 1 * 1024 * 1024
         MAX_REGION_SIZE = 16 * 1024 * 1024 * 1024
-        PRIORITY_ALIGNMENT = 256 * 1024 * 1024
 
         try:
             self.mem_file = open(mem_path, 'r+b', buffering=0)
@@ -524,10 +503,14 @@ class LinuxScanner(MemoryScanner):
             else:
                 other_regions.append(r)
 
-        # Sort priority regions by size descending (larger likely main RAM)
-        priority_regions.sort(key=lambda x: x['size'], reverse=True)
-        # Sort others by size descending too
-        other_regions.sort(key=lambda x: x['size'], reverse=True)
+        def _sort_key(r):
+            rank = _preferred_region_rank(r['size'])
+            return (0 if rank is not None else 1, rank if rank is not None else 999, -r['size'])
+
+        # Sort priority regions (emulator RAM blocks are usually aligned, but prefer known sizes first)
+        priority_regions.sort(key=_sort_key)
+        # Sort others similarly
+        other_regions.sort(key=_sort_key)
 
         scan_passes = [
             ("PRIORITY", priority_regions),
@@ -618,10 +601,7 @@ class LinuxScanner(MemoryScanner):
         self.pid = 0
 
 DEFAULT_CONFIG = {
-    "sd_card_path": "",
     "emulator_path": "",
-    "target_ip": "127.0.0.1",
-    "target_port": 5555,
     "sensitivity": 1.0,
     "invert_y": False,
     "toggle_hotkey": "F3",
@@ -652,12 +632,21 @@ def load_config():
     if path.exists():
         try:
             with open(path, 'r') as f:
-                loaded = json.load(f)
+                loaded = json.load(f) or {}
+
+                # Only accept known keys (older versions may have extra fields)
                 config = DEFAULT_CONFIG.copy()
-                config.update(loaded)
-                if 'mouse_bindings' in loaded:
-                    config['mouse_bindings'] = DEFAULT_CONFIG['mouse_bindings'].copy()
+                config['mouse_bindings'] = DEFAULT_CONFIG['mouse_bindings'].copy()
+
+                for key, value in loaded.items():
+                    if key == 'mouse_bindings':
+                        continue
+                    if key in config:
+                        config[key] = value
+
+                if isinstance(loaded.get('mouse_bindings'), dict):
                     config['mouse_bindings'].update(loaded['mouse_bindings'])
+
                 return config
         except:
             pass
@@ -1322,7 +1311,6 @@ class MouseCamApp:
         self.config = load_config()
         self.capture = MouseCapture()
         self.enabled = False
-        self.sequence = 0
         self._running = False
         self.msg_queue = queue.Queue()
         self._build_ui()
@@ -1373,11 +1361,6 @@ class MouseCamApp:
         self.ipc_label = ttk.Label(status_frame, text="", foreground='orange', wraplength=400)
         self.ipc_label.pack()
 
-        if sys.platform == 'win32':
-            self.dll_status_label = ttk.Label(status_frame, text="DLL: Waiting...", foreground='gray', wraplength=300)
-            self.dll_status_label.pack(pady=(5, 0))
-
-
         emu_frame = ttk.LabelFrame(parent, text="Emulator Executable", padding="10")
         emu_frame.pack(fill=tk.X, pady=(0, 10))
 
@@ -1401,7 +1384,7 @@ class MouseCamApp:
         ttk.Label(sens_row, text="Sensitivity:").pack(side=tk.LEFT)
         self.sens_var = tk.DoubleVar(value=self.config['sensitivity'])
         self.sens_var.trace_add('write', lambda *_: self._auto_save())
-        ttk.Scale(sens_row, from_=0.1, to=3.0, variable=self.sens_var, orient=tk.HORIZONTAL, length=180).pack(side=tk.LEFT, padx=5)
+        ttk.Scale(sens_row, from_=0.1, to=5.0, variable=self.sens_var, orient=tk.HORIZONTAL, length=180).pack(side=tk.LEFT, padx=5)
         self.sens_label = ttk.Label(sens_row, text=f"{self.sens_var.get():.1f}")
         self.sens_label.pack(side=tk.LEFT)
 
@@ -1415,8 +1398,7 @@ class MouseCamApp:
         tools_frame = ttk.Frame(parent)
         tools_frame.pack(fill=tk.X, pady=10)
 
-        btn_text = "Inject & Connect" if sys.platform == 'win32' else "Scan Memory"
-        self.scan_btn = ttk.Button(tools_frame, text=btn_text, command=self._request_scan)
+        self.scan_btn = ttk.Button(tools_frame, text="Scan Memory", command=self._request_scan)
         self.scan_btn.pack(side=tk.LEFT)
         self.info_label = ttk.Label(tools_frame, text="v1.0", foreground="gray")
         self.info_label.pack(side=tk.RIGHT)
@@ -1518,7 +1500,6 @@ class MouseCamApp:
 
     def _request_scan(self):
         self._mem_connected = False
-        self._mem_address = None
         self._scan_requested = True
         self._mem_status = "Scan pending..."
 
@@ -1536,23 +1517,6 @@ class MouseCamApp:
                 self.ipc_label.configure(text=f"✓ {status}", foreground='green')
             else:
                 self.ipc_label.configure(text=f"⏳ {status}", foreground='orange')
-
-            if sys.platform == 'win32' and hasattr(self, 'dll_status_label'):
-                dll_status = getattr(self, '_dll_status', 'DLL: Waiting...')
-                dll_code = getattr(self, '_dll_status_code', 0)
-
-                if dll_code == 1:
-                    color = 'orange'
-                elif dll_code == 2:
-                    color = 'blue'
-                elif dll_code == 3:
-                    color = 'green'
-                elif dll_code == 4:
-                    color = 'red'
-                else:
-                    color = 'gray'
-
-                self.dll_status_label.configure(text=f"DLL: {dll_status}", foreground=color)
 
             self.root.after(100, self._update_ui)
 
@@ -1589,30 +1553,10 @@ class MouseCamApp:
 
         if sys.platform == 'win32':
             scanner = WindowsScanner()
-            injector = WindowsInjector()
-            pipe_client = PipeClient(r'\\.\pipe\totk_mousecam')
-
-            dll_name = "MouseCamInjector.dll"
-            if getattr(sys, 'frozen', False):
-                if hasattr(sys, '_MEIPASS'):
-                    base_path = sys._MEIPASS
-                else:
-                    base_path = os.path.dirname(sys.executable)
-            else:
-                base_path = os.path.dirname(os.path.abspath(__file__))
-
-            dll_path = os.path.join(base_path, dll_name)
-            if not os.path.exists(dll_path):
-                dll_path = os.path.join(base_path, 'injector', dll_name)
-
-            if not os.path.exists(dll_path):
-                dll_path = os.path.join(os.path.dirname(base_path), dll_name)
-
-            if not os.path.exists(dll_path):
-                print(f"WARNING: {dll_name} not found at {dll_path}")
         else:
             scanner = LinuxScanner()
 
+        self._target_addresses = []
         self._mem_connected = False
         self._mem_status = "Waiting for Process..."
         self._scan_requested = False
@@ -1625,15 +1569,17 @@ class MouseCamApp:
                 if config_emu_path:
                     emu_exe = os.path.basename(config_emu_path)
                     if emu_exe:
-                         target_process_names = [emu_exe]
+                        target_process_names = [emu_exe]
 
-                if sys.platform == 'win32':
-                    process_name, pid = scanner.find_process(target_process_names)
-                else:
-                    process_name, pid = scanner.find_process(target_process_names)
+                process_name, pid = scanner.find_process(target_process_names)
 
                 if not pid:
                     self._mem_connected = False
+                    self._target_addresses = []
+                    try:
+                        scanner.reset()
+                    except Exception:
+                        pass
                     self._mem_status = "Waiting for Emulator..."
                     self._update_ui()
                     time.sleep(1)
@@ -1642,94 +1588,45 @@ class MouseCamApp:
                 self._mem_status = f"Found {process_name} ({pid})"
                 self._update_ui()
 
-                if sys.platform == 'win32':
-                     if pipe_client.connect():
-                         self._mem_connected = True
-                         self._mem_status = "Connected (Internal)"
-                         self.capture.emulator_process_name = process_name
+                if self._scan_requested:
+                    self._mem_status = "Scanning..."
+                    self._update_ui()
 
-                         for _ in range(20):
-                             status = pipe_client.read_status()
-                             if status:
-                                 self._dll_status = status['message']
-                                 self._dll_status_code = status['code']
-                                 print(f"DEBUG: Got DLL status: {status['message']}")
-                                 break
-                             time.sleep(0.1)
+                    addrs = scanner.scan(pid)
+                    if addrs:
+                        self._target_addresses = addrs
+                        self.capture.emulator_process_name = process_name
 
-                         self._update_ui()
-                     else:
-                         if self._scan_requested:
-                             self._mem_status = "Injecting DLL..."
-                             self._dll_status = "Injecting..."
-                             self._dll_status_code = 1
-                             self._update_ui()
-
-                             if not os.path.exists(dll_path):
-                                 self._mem_status = "Error: DLL Not Found"
-                                 self._scan_requested = False
-                                 time.sleep(2)
-                                 continue
-
-                             if injector.inject(pid, dll_path):
-                                 time.sleep(0.5)
-                                 if pipe_client.connect():
-                                     self._mem_connected = True
-                                     self._mem_status = "Connected (Internal)"
-                                     self.capture.emulator_process_name = process_name
-
-                                     self._dll_status = "Scanning..."
-                                     self._dll_status_code = 1
-                                     self._update_ui()
-
-                                     for _ in range(50):
-                                         status = pipe_client.read_status()
-                                         if status:
-                                             self._dll_status = status['message']
-                                             self._dll_status_code = status['code']
-                                             print(f"DEBUG: Got DLL status: {status['message']}")
-                                         time.sleep(0.1)
-                                 else:
-                                     self._mem_status = "Injection Success, Pipe Fail"
-                             else:
-                                 self._mem_status = "Injection Failed"
-
-                             self._scan_requested = False
-                             self._update_ui()
-                else:
-                    if self._scan_requested:
-                        self._mem_status = "Scanning..."
-                        self._update_ui()
-
-                        addrs = scanner.scan(pid)
-                        if addrs:
-                            self._target_addresses = addrs
+                        if sys.platform == 'win32' and not getattr(scanner, 'can_write', True):
+                            self._mem_connected = False
+                            self._mem_status = "Scan OK but no write access (run as admin)"
+                        else:
                             self._mem_connected = True
                             self._mem_status = f"Connected ({len(addrs)} addrs)"
-                            self.capture.emulator_process_name = process_name
-                        else:
-                            self._mem_status = "Scan Failed - Not Found"
+                    else:
+                        self._mem_connected = False
+                        self._target_addresses = []
+                        self._mem_status = "Scan Failed - Not Found"
 
-                        self._scan_requested = False
-                        self._update_ui()
+                    self._scan_requested = False
+                    self._update_ui()
 
                 while self._mem_connected:
-                    if sys.platform == 'win32':
-                        if not pipe_client.handle:
-                            self._mem_connected = False; break
-                        if not scanner.is_process_alive():
-                            self._mem_connected = False; pipe_client.close(); break
-                    else:
-                        if not scanner.is_process_alive():
-                            self._mem_connected = False; break
+                    if not scanner.is_process_alive():
+                        self._mem_connected = False
+                        break
 
                     try:
                         dx, dy, scroll = self.capture.get_and_reset_delta()
 
-
-                        dx_scaled = float(dx) * (self.config['sensitivity'] * 0.5)
-                        dy_scaled = float(dy) * (self.config['sensitivity'] * 0.5)
-                        if self.config['invert_y']: dy_scaled = -dy_scaled
+                        # Mouse → right stick scale
+                        # Baseline is 1/3 of the previous behavior (previous was `0.5 * sensitivity`).
+                        RIGHT_STICK_BASE_SCALE = (0.5 / 3.0)
+                        scale = float(self.config['sensitivity']) * RIGHT_STICK_BASE_SCALE
+                        dx_scaled = float(dx) * scale
+                        dy_scaled = float(dy) * scale
+                        if self.config['invert_y']:
+                            dy_scaled = -dy_scaled
 
                         packet.delta_x += dx_scaled
                         packet.delta_y += dy_scaled
@@ -1743,45 +1640,50 @@ class MouseCamApp:
                         for btn_name, binding in self.config['mouse_bindings'].items():
                             if binding != "None" and binding in BUTTON_FLAGS:
                                 is_pressed = False
-                                if btn_name == "left": is_pressed = buttons.get('left', False)
-                                elif btn_name == "right": is_pressed = buttons.get('right', False)
-                                elif btn_name == "middle": is_pressed = buttons.get('middle', False)
-                                elif btn_name == "mouse4": is_pressed = buttons.get('x1', False)
-                                elif btn_name == "mouse5": is_pressed = buttons.get('x2', False)
-                                if is_pressed: btn_mask |= BUTTON_FLAGS[binding]
+                                if btn_name == "left":
+                                    is_pressed = buttons.get('left', False)
+                                elif btn_name == "right":
+                                    is_pressed = buttons.get('right', False)
+                                elif btn_name == "middle":
+                                    is_pressed = buttons.get('middle', False)
+                                elif btn_name == "mouse4":
+                                    is_pressed = buttons.get('x1', False)
+                                elif btn_name == "mouse5":
+                                    is_pressed = buttons.get('x2', False)
+                                if is_pressed:
+                                    btn_mask |= BUTTON_FLAGS[binding]
                         packet.buttons = btn_mask
 
-                        if buttons.get('middle', False): packet.raw_buttons |= 0x04
-                        else: packet.raw_buttons &= ~0x04
+                        if buttons.get('middle', False):
+                            packet.raw_buttons |= 0x04
+                        else:
+                            packet.raw_buttons &= ~0x04
 
                         data = packet.pack()
 
-                        success = False
-                        if sys.platform == 'win32':
-                            success = pipe_client.write(data)
+                        success_count = 0
+                        for addr in self._target_addresses:
+                            if scanner.write(addr, data):
+                                success_count += 1
 
-                            status = pipe_client.read_status()
-                            if status:
-                                self._dll_status = status['message']
-                                self._dll_status_code = status['code']
-                        else:
-                            success_count = 0
-                            for addr in self._target_addresses:
-                                if scanner.write(addr, data): success_count += 1
-                            if success_count > 0: success = True
-
-                        if not success:
+                        if success_count <= 0:
                             raise Exception("Write failed")
 
                         time.sleep(0.016)
 
                         if self._scan_requested:
-                             self._scan_requested = False
+                            self._scan_requested = False
 
-                    except Exception as e:
+                    except Exception:
                         self._mem_connected = False
-                        if sys.platform == 'win32': pipe_client.close()
+                        self._mem_status = "Disconnected"
+                        self._update_ui()
                         time.sleep(1)
+
+                try:
+                    scanner.reset()
+                except Exception:
+                    pass
 
                 time.sleep(0.5)
 
@@ -1830,7 +1732,7 @@ if __name__ == '__main__':
         sys.stdout = FileLogger(log_path)
         sys.stderr = sys.stdout
         print(f"MouseCam Companion Log Started: {time.ctime()}")
-        print(f"Version: 2.0 (Internal Injection)")
+        print(f"Version: 2.1 (Memory Scan)")
     except Exception as e:
         pass
 

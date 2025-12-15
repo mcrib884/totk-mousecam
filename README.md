@@ -17,8 +17,8 @@ Mouse-controlled camera for The Legend of Zelda: Tears of the Kingdom on Nintend
 1. Download the latest release from [Releases](../../releases)
 2. Extract and copy `totk-mousecam/` to your emulator's mod folder
 3. Run `MouseCamCompanion.exe` wherever you want
-4. Start TOTK and click "**Inject & Connect**"
-5. Press F3 to toggle mouse capture once both the companion app and dll says ready 
+4. Start TOTK and click "**Scan Memory**"
+5. Press F3 to toggle mouse capture once the companion says ready
 
 ### Linux
 
@@ -37,8 +37,7 @@ Mouse-controlled camera for The Legend of Zelda: Tears of the Kingdom on Nintend
 
 **Companion (Windows):**
 - Python 3.8+
-- **Microsoft Visual Studio 2019/2022** with "Desktop development with C++" workload
-  - Required for building `MouseCamInjector.dll`
+- Administrator privileges may be required (for reading/writing emulator memory)
 
 **Companion (Linux):**
 - Python 3.8+
@@ -74,7 +73,6 @@ Settings are saved automatically to:
 totk-mousecam-final/
 ├── mod/                    # Switch mod (exlaunch)
 ├── companion/              # Desktop companion app
-│   ├── injector/           # Windows DLL injector source
 │   ├── mousecam_companion.py
 │   └── requirements.txt
 ├── build_windows.cmd

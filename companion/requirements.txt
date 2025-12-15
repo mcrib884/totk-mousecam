@@ -1,1 +1,2 @@
 pynput
+keyboard; sys_platform == "win32"
