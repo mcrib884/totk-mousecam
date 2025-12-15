@@ -58,6 +58,7 @@ echo [2/4] Building mod...
 cd mod
 make clean
 make
+if exist deploy\main.npdm del /F /Q deploy\main.npdm
 if %ERRORLEVEL% neq 0 (
     echo WARNING: Mod build had errors but may have succeeded. Check output above.
 )

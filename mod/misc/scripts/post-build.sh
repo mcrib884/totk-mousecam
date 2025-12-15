@@ -2,7 +2,7 @@
 set -e
 
 OUT_NSO=${OUT}/${BINARY_NAME}
-OUT_NPDM=${OUT}/main.npdm
+# OUT_NPDM=${OUT}/main.npdm
 
 # Clear older build.
 rm -rf ${OUT}
@@ -12,7 +12,7 @@ mkdir -p ${OUT}
 
 # Copy build into out
 mv ${NAME}.nso ${OUT_NSO}
-mv ${NAME}.npdm ${OUT_NPDM}
+rm -f ${NAME}.npdm
 
 # Copy ELF to user path if defined.
 if [ ! -z $ELF_EXTRACT ]; then

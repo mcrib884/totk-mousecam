@@ -3,6 +3,17 @@
 #include "nn/hid.h"
 #include <cmath>
 #include <cstring>
+constexpr uintptr_t PAUSE_MGR_INSTANCE = 0x04728688;
+constexpr uintptr_t PAUSE_FLAGS_OFFSET = 0x30;
+
+static uintptr_t s_moduleBase = 0;
+
+uintptr_t GetModuleBase() {
+    if (s_moduleBase == 0) {
+        s_moduleBase = exl::util::GetMainModuleInfo().m_Text.m_Start;
+    }
+    return s_moduleBase;
+}
 
 namespace MouseCam {
     int g_frameCount = 0;
@@ -29,6 +40,21 @@ namespace MouseCam {
     float g_targetRadius = 5.0f;
     bool g_firstZoom = true;
     float g_defaultRadius = 5.0f;
+    bool g_inMenu = false;
+    float g_menuStickX = 0.0f;
+    float g_menuStickY = 0.0f;
+}
+
+bool IsGamePaused() {
+    uintptr_t base = GetModuleBase();
+    uintptr_t* pInstance = reinterpret_cast<uintptr_t*>(base + PAUSE_MGR_INSTANCE);
+    if (pInstance == nullptr || *pInstance == 0) return false;
+    
+    uintptr_t instance = *pInstance;
+    uint32_t* pFlags = reinterpret_cast<uint32_t*>(instance + PAUSE_FLAGS_OFFSET);
+    if (pFlags == nullptr) return false;
+    
+    return *pFlags != 0;
 }
 
 #pragma pack(push, 1)
@@ -106,6 +132,7 @@ void UpdateMouseFromIPC() {
     
     MouseCam::g_captureEnabled = data.enabled != 0;
     MouseCam::g_mappedButtons = data.buttons;
+    MouseCam::g_inMenu = IsGamePaused();
     
     if (data.enabled) {
         if (s_firstRead) {
@@ -127,11 +154,23 @@ void UpdateMouseFromIPC() {
         if (data.rawButtons & 0x04) {
             MouseCam::g_resetZoom = true;
         }
+        
+        if (MouseCam::g_inMenu) {
+            float menuSensitivity = 500.0f;
+            MouseCam::g_menuStickX += dX * menuSensitivity;
+            MouseCam::g_menuStickY += -dY * menuSensitivity;
+            if (MouseCam::g_menuStickX > 32767.0f) MouseCam::g_menuStickX = 32767.0f;
+            if (MouseCam::g_menuStickX < -32767.0f) MouseCam::g_menuStickX = -32767.0f;
+            if (MouseCam::g_menuStickY > 32767.0f) MouseCam::g_menuStickY = 32767.0f;
+            if (MouseCam::g_menuStickY < -32767.0f) MouseCam::g_menuStickY = -32767.0f;
+        }
     } else {
         s_firstRead = true;
         MouseCam::g_accumulatedDeltaX = 0;
         MouseCam::g_accumulatedDeltaY = 0;
         MouseCam::g_accumulatedScroll = 0;
+        MouseCam::g_menuStickX = 0;
+        MouseCam::g_menuStickY = 0;
     }
 }
 
@@ -153,12 +192,21 @@ constexpr uintptr_t GET_NPAD_STATES_FULLKEY = 0x02b180a0;
 HOOK_DEFINE_TRAMPOLINE(GetNpadStatesHook) {
     static void Callback(nn::hid::NpadFullKeyState* states, int count, uint const& port) {
         Orig(states, count, port);
-        if (port == 0 && MouseCam::g_captureEnabled && MouseCam::g_mappedButtons != 0) {
+        UpdateMouseFromIPC();
+        if (port == 0 && MouseCam::g_captureEnabled) {
             if (states == nullptr) return;
             for (int i = 0; i < count; i++) {
-                uint64_t* buttonsPtr = reinterpret_cast<uint64_t*>(&states[i].mButtons);
-                if (buttonsPtr != nullptr) {
-                    *buttonsPtr |= MouseCam::g_mappedButtons;
+                if (MouseCam::g_mappedButtons != 0) {
+                    uint64_t* buttonsPtr = reinterpret_cast<uint64_t*>(&states[i].mButtons);
+                    if (buttonsPtr != nullptr) {
+                        *buttonsPtr |= MouseCam::g_mappedButtons;
+                    }
+                }
+                if (MouseCam::g_inMenu) {
+                    states[i].mAnalogStickR.X = static_cast<int32_t>(MouseCam::g_menuStickX);
+                    states[i].mAnalogStickR.Y = static_cast<int32_t>(MouseCam::g_menuStickY);
+                    MouseCam::g_menuStickX = 0;
+                    MouseCam::g_menuStickY = 0;
                 }
             }
         }
@@ -170,10 +218,19 @@ constexpr uintptr_t GET_NPAD_STATES_HANDHELD = 0x02b18130;
 HOOK_DEFINE_TRAMPOLINE(GetNpadStatesHandheldHook) {
     static void Callback(nn::hid::NpadHandheldState* states, int count, uint const& port) {
         Orig(states, count, port);
-        if (port == 0 && MouseCam::g_captureEnabled && MouseCam::g_mappedButtons != 0) {
+        UpdateMouseFromIPC();
+        if (port == 0 && MouseCam::g_captureEnabled) {
             for (int i = 0; i < count && states != nullptr; i++) {
-                uint64_t* buttonsPtr = reinterpret_cast<uint64_t*>(&states[i].mButtons);
-                *buttonsPtr |= MouseCam::g_mappedButtons;
+                if (MouseCam::g_mappedButtons != 0) {
+                    uint64_t* buttonsPtr = reinterpret_cast<uint64_t*>(&states[i].mButtons);
+                    *buttonsPtr |= MouseCam::g_mappedButtons;
+                }
+                if (MouseCam::g_inMenu) {
+                    states[i].mAnalogStickR.X = static_cast<int32_t>(MouseCam::g_menuStickX);
+                    states[i].mAnalogStickR.Y = static_cast<int32_t>(MouseCam::g_menuStickY);
+                    MouseCam::g_menuStickX = 0;
+                    MouseCam::g_menuStickY = 0;
+                }
             }
         }
     }
@@ -184,10 +241,19 @@ constexpr uintptr_t GET_NPAD_STATES_JOYDUAL = 0x02b18100;
 HOOK_DEFINE_TRAMPOLINE(GetNpadStatesJoyDualHook) {
     static void Callback(nn::hid::NpadJoyDualState* states, int count, uint const& port) {
         Orig(states, count, port);
-        if (port == 0 && MouseCam::g_captureEnabled && MouseCam::g_mappedButtons != 0) {
+        UpdateMouseFromIPC();
+        if (port == 0 && MouseCam::g_captureEnabled) {
             for (int i = 0; i < count && states != nullptr; i++) {
-                uint64_t* buttonsPtr = reinterpret_cast<uint64_t*>(&states[i].mButtons);
-                *buttonsPtr |= MouseCam::g_mappedButtons;
+                if (MouseCam::g_mappedButtons != 0) {
+                    uint64_t* buttonsPtr = reinterpret_cast<uint64_t*>(&states[i].mButtons);
+                    *buttonsPtr |= MouseCam::g_mappedButtons;
+                }
+                if (MouseCam::g_inMenu) {
+                    states[i].mAnalogStickR.X = static_cast<int32_t>(MouseCam::g_menuStickX);
+                    states[i].mAnalogStickR.Y = static_cast<int32_t>(MouseCam::g_menuStickY);
+                    MouseCam::g_menuStickX = 0;
+                    MouseCam::g_menuStickY = 0;
+                }
             }
         }
     }
@@ -201,7 +267,7 @@ HOOK_DEFINE_TRAMPOLINE(CamAlphaHook) {
         UpdateMouseFromIPC();
         Orig(deltaTime, param2, param3);
         
-        if (param3 != nullptr && MouseCam::g_captureEnabled) {
+        if (param3 != nullptr && MouseCam::g_captureEnabled && !MouseCam::g_inMenu) {
             if ((uintptr_t)param3 < 0x1000) {
                 Logging.Log("CamHook: Bad param3 %p", param3);
                 return;
@@ -304,7 +370,7 @@ HOOK_DEFINE_TRAMPOLINE(CamAlphaHook) {
 };
 
 extern "C" void exl_main(void*, void*) {
-    Logging.Log("MouseCam: v5.0 - Memory Injection IPC");
+    Logging.Log("MouseCam: v6.0 - Menu Detection");
     exl::hook::Initialize();
     CamAlphaHook::InstallAtOffset(CAMERA_ALPHA_UPDATE);
     GetNpadStatesHook::InstallAtOffset(GET_NPAD_STATES_FULLKEY);

@@ -53,6 +53,7 @@ if [ $SKIP_MOD -eq 0 ]; then
     cd mod
     make clean
     make || echo "WARNING: Mod build had errors but may have succeeded"
+    rm -f deploy/main.npdm
     cd ..
     echo "Done."
     echo ""

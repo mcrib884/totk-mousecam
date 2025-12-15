@@ -365,17 +365,20 @@ class LinuxScanner(MemoryScanner):
         super().__init__()
         self.mem_file = None
         self.pid = 0
+        self.scan_attempt = 0
 
     def find_process(self, process_names):
-        print(f"DEBUG: Looking for processes: {process_names}")
+        print(f"[SCAN] Searching for processes: {process_names}")
 
         candidates = []
         process_info = {}
+        scanned_count = 0
 
         try:
             for pid_str in os.listdir('/proc'):
                 if not pid_str.isdigit(): continue
                 pid = int(pid_str)
+                scanned_count += 1
 
                 try:
                     info = {'pid': pid, 'ppid': 0, 'rss': 0, 'name': '', 'cmd': ''}
@@ -408,16 +411,19 @@ class LinuxScanner(MemoryScanner):
                             matched = True
 
                     if matched:
-                        print(f"DEBUG: Found candidate PID {pid} ({info['name']}) RSS={info['rss']}kB")
+                        print(f"[SCAN] Match: PID {pid} name='{info['name']}' RSS={info['rss']}kB")
                         candidates.append(pid)
 
                 except Exception:
                     continue
         except Exception as e:
-            print(f"DEBUG: Error identifying processes: {e}")
+            print(f"[SCAN] FAIL: Error listing /proc: {e}")
             return None, None
 
+        print(f"[SCAN] Scanned {scanned_count} processes, {len(candidates)} candidates")
+
         if not candidates:
+            print("[SCAN] No matching process found")
             return None, None
 
         children_map = {}
@@ -438,7 +444,7 @@ class LinuxScanner(MemoryScanner):
                         queue.append(child)
                         child_name = process_info.get(child, {}).get('name', 'Unknown')
                         child_rss = process_info.get(child, {}).get('rss', 0)
-                        print(f"DEBUG: Adding descendant PID {child} ({child_name}) RSS={child_rss}kB")
+                        print(f"[SCAN] Child: PID {child} name='{child_name}' RSS={child_rss}kB")
 
         best_pid = 0
         max_rss = -1
@@ -453,63 +459,114 @@ class LinuxScanner(MemoryScanner):
                 best_name = process_info[pid]['name']
 
         if best_pid:
-            print(f"DEBUG: Selected PID {best_pid} ({best_name}) with {max_rss}kB RSS")
+            print(f"[SCAN] Selected: PID {best_pid} name='{best_name}' RSS={max_rss}kB")
             self.pid = best_pid
             return best_name, best_pid
 
+        print("[SCAN] No suitable process found after filtering")
         return None, None
 
     def scan(self, pid):
-        print(f"DEBUG: Starting scan for PID {pid}")
+        self.scan_attempt += 1
+        print(f"[SCAN] ===== Attempt #{self.scan_attempt} for PID {pid} =====")
+        
         maps_path = f'/proc/{pid}/maps'
         mem_path = f'/proc/{pid}/mem'
         found = []
 
         CHUNK_SIZE = 50 * 1024 * 1024
         MIN_REGION_SIZE = 1 * 1024 * 1024
+        MAX_REGION_SIZE = 16 * 1024 * 1024 * 1024
+        PRIORITY_ALIGNMENT = 256 * 1024 * 1024
 
         try:
             self.mem_file = open(mem_path, 'r+b', buffering=0)
-            print("DEBUG: Opened process memory")
+            print(f"[SCAN] Opened {mem_path}")
+        except PermissionError as e:
+            print(f"[SCAN] FAIL: Permission denied opening {mem_path}")
+            print(f"[SCAN] Run with: sudo ./MouseCamCompanion")
+            return found
+        except Exception as e:
+            print(f"[SCAN] FAIL: Cannot open {mem_path}: {e}")
+            return found
 
-            regions = []
+        regions = []
+        try:
             with open(maps_path, 'r') as maps:
                 for line in maps:
                     parts = line.split()
-                    if len(parts) < 2:
-                        continue
+                    if len(parts) < 2: continue
                     perms = parts[1]
-
-                    if 'r' not in perms or 'w' not in perms:
-                        continue
+                    if 'r' not in perms or 'w' not in perms: continue
 
                     addr_range = parts[0].split('-')
                     start = int(addr_range[0], 16)
                     end = int(addr_range[1], 16)
                     size = end - start
 
-                    if size < MIN_REGION_SIZE:
-                        continue
+                    if size < MIN_REGION_SIZE or size > MAX_REGION_SIZE: continue
 
                     path = parts[5] if len(parts) > 5 else ''
-                    is_anon = (path == '' or path.startswith('['))
-                    priority = 0 if is_anon else 1
+                    regions.append({'start': start, 'size': size, 'perms': perms, 'path': path})
 
-                    regions.append((priority, -size, start, size))
+        except Exception as e:
+            print(f"[SCAN] FAIL: Cannot read {maps_path}: {e}")
+            return found
 
-            regions.sort()
-            print(f"DEBUG: Scanning {len(regions)} candidate regions")
+        # Split into priority and others
+        priority_regions = []
+        other_regions = []
 
-            for priority, neg_size, start, size in regions:
+        for r in regions:
+            # Check if size is a multiple of 256MB
+            if r['size'] % PRIORITY_ALIGNMENT == 0:
+                priority_regions.append(r)
+            else:
+                other_regions.append(r)
+
+        # Sort priority regions by size descending (larger likely main RAM)
+        priority_regions.sort(key=lambda x: x['size'], reverse=True)
+        # Sort others by size descending too
+        other_regions.sort(key=lambda x: x['size'], reverse=True)
+
+        scan_passes = [
+            ("PRIORITY", priority_regions),
+            ("FALLBACK", other_regions)
+        ]
+
+        regions_scanned = 0
+        bytes_scanned = 0
+        read_failures = 0
+
+        for pass_name, target_regions in scan_passes:
+            if not target_regions: continue
+            
+            print(f"[SCAN] Starting {pass_name} pass: {len(target_regions)} regions")
+
+            for r in target_regions:
+                regions_scanned += 1
+                start, size, perms, path = r['start'], r['size'], r['perms'], r['path']
+                region_type = "anon" if (path == '' or path.startswith('[')) else "file"
+
+                print(f"[SCAN] Checking {hex(start)} size={size/1024/1024:.1f}MB ({pass_name})", flush=True)
+
                 try:
                     read_offset = 0
                     while read_offset < size:
                         size_to_read = min(CHUNK_SIZE, size - read_offset)
-                        self.mem_file.seek(start + read_offset)
-                        chunk = self.mem_file.read(size_to_read)
-
-                        if not chunk:
+                        addr = start + read_offset
+                        
+                        try:
+                            self.mem_file.seek(addr)
+                            chunk = self.mem_file.read(size_to_read)
+                            bytes_scanned += len(chunk) if chunk else 0
+                        except Exception as e:
+                            read_failures += 1
+                            if read_failures <= 5:
+                                print(f"[SCAN] Read fail: {hex(addr)}: {e}", flush=True)
                             break
+
+                        if not chunk: break
 
                         idx = chunk.find(self.magic_bytes)
                         if idx != -1:
@@ -517,21 +574,16 @@ class LinuxScanner(MemoryScanner):
                                 ver = struct.unpack('<I', chunk[idx+4:idx+8])[0]
                                 if ver == 1:
                                     found_addr = start + read_offset + idx
-                                    print(f"DEBUG: Found magic at {hex(found_addr)}")
+                                    print(f"[SCAN] SUCCESS: Magic found at {hex(found_addr)}")
                                     found.append(found_addr)
                                     return found
 
                         read_offset += CHUNK_SIZE
 
-                except Exception:
+                except Exception as e:
                     continue
 
-            print(f"DEBUG: Scan complete, found {len(found)} addresses")
-        except Exception as e:
-            print(f"Linux scan error: {e}")
-            if isinstance(e, PermissionError):
-                print("DEBUG: Permission denied! Try running with sudo.")
-
+        print(f"[SCAN] FAIL: Magic not found after scanning {regions_scanned} regions")
         return found
 
     def is_process_alive(self):
@@ -544,7 +596,7 @@ class LinuxScanner(MemoryScanner):
 
     def write(self, address, data):
         if not self.mem_file:
-            print("DEBUG: Write failed - no mem_file handle", flush=True)
+            print("[WRITE] FAIL: No mem_file handle", flush=True)
             return False
         try:
             self.mem_file.seek(address)
@@ -552,17 +604,17 @@ class LinuxScanner(MemoryScanner):
             self.mem_file.flush()
             return True
         except Exception as e:
-            print(f"DEBUG: Write exception at {hex(address)}: {e}", flush=True)
+            print(f"[WRITE] FAIL: {hex(address)}: {e}", flush=True)
             return False
 
     def reset(self):
+        print(f"[SCAN] Reset: closing PID {self.pid}")
         if self.mem_file:
             try:
                 self.mem_file.close()
             except:
                 pass
         self.mem_file = None
-        self.pid = 0
         self.pid = 0
 
 DEFAULT_CONFIG = {
@@ -724,6 +776,15 @@ class MouseCapture:
             btn_map[pynput_mouse.Button.x2] = 'x2'
         except AttributeError:
             pass
+        
+        if sys.platform != 'win32':
+            try:
+                btn_map[pynput_mouse.Button.button8] = 'x1'
+                btn_map[pynput_mouse.Button.button9] = 'x2'
+            except AttributeError:
+                pass
+
+
 
         with self._lock:
             if button in btn_map:
