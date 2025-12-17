@@ -18,13 +18,13 @@ Mouse-controlled camera for The Legend of Zelda: Tears of the Kingdom on Nintend
 2. Extract and copy `totk-mousecam/` to your emulator's mod folder
 3. Run `MouseCamCompanion.exe` wherever you want
 4. Start TOTK and click "**Scan Memory**"
-5. Press F3 to toggle mouse capture once the companion says ready
+5. Press F3 to toggle mouse capture once once its ready
 
 ### Linux
 
 1. Download the latest Linux release
-2. Copy `atmosphere/` folder to your emulator's mod folder
-3. Run `./MouseCamCompanion` (may require `sudo` for input capture)
+2. Copy `totk-mousecam/` folder to your emulator's mod folder
+3. Run `./MouseCamCompanion` (require `sudo` for input capture)
 4. Start TOTK and click "**Scan Memory**"
 5. Press F3 to toggle mouse capture once its ready 
 
@@ -57,7 +57,7 @@ chmod +x build_linux.sh
 ```
 
 Output:
-- Mod: `mod/deploy/atmosphere/`
+- Mod: `mod/deploy/totk-mousecam/`
 - Windows Companion: `companion/dist/windows/MouseCamCompanion.exe`
 - Linux Companion: `companion/dist/linux/MouseCamCompanion`
 
@@ -83,5 +83,6 @@ totk-mousecam-final/
 ## License
 
 GPL v2
+
 
 mod by mcrib884
